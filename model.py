@@ -200,8 +200,11 @@ class GTM(pl.LightningModule):
         f1 = self.f1_metric(pred, gt)
         return acc, rec, pre, f1
 
-
     def get_score(self, gt, pred_ps, inv_transform=False):
+        # r2score = R2Score()
+        # r2_score = torch.mean(torch.stack(
+        #     [r2score(pred_ps.detach().cpu()[i], gt.detach().cpu()[i]) for i in
+        #         range(len(gt))]))
         if inv_transform :
             pred_ps = torch.from_numpy(inv_boxcox(pred_ps, self.boxcox_opt_lambda)).squeeze()
 
@@ -209,8 +212,145 @@ class GTM(pl.LightningModule):
         smape_adjust = torch.mean(torch.stack(
             [ad_smape(pred_ps.detach().cpu()[i], gt.detach().cpu()[i]) * 0.5
                 for i in range(len(gt))]))
+        # ad_smape = SymmetricMeanAbsolutePercentageError()
 
         return smape_adjust
+    
+
+    def plot_image_text(self, item_number):
+        img, text_description, _, _, _ = self.get_features.get_several_featrues(item_number)
+        text_description = textwrap.fill(text_description[0], width=17)
+        gs = gridspec.GridSpec(nrows=1, ncols=2, width_ratios=[1, 1], )
+        plt.subplot(gs[0]).imshow(img)
+        plt.title(item_number)
+        plt.subplot(gs[1]).text(0.1, 0.4, text_description)
+        self.logger.log_image(key=f'img_text_{item_number}', images=[plt])
+        plt.show()
+        plt.clf()
+
+    
+    def plot_gt_pred(self, title, date_range, gt, pred_gs, pred_ps, item_number):
+        plt.plot(date_range, gt.detach().cpu(), color='r')
+        plt.plot(date_range, pred_gs.detach().cpu(), color='g')
+        plt.plot(date_range, pred_ps.detach().cpu(), color='b')
+        plt.title(f'{title}_{item_number}')
+        plt.legend(['gt', 'pred_gs', 'pred_ps'])
+        self.logger.log_image(key=f'{title}_{item_number}', images=[plt])
+        plt.show()
+        plt.clf()
+
+
+    def get_3to6step_score(self, batch, batch_idx, phase):
+        item_sales, temporal_features, ntrends, images, texts, scalers,\
+            real_value_sales, release_dates, item_numbers_idx,\
+            meta_data, qcut_label, target_reg = batch
+
+        batch_size = self.batch_size
+        plot_idx = [batch_idx * batch_size + i for i in range(len(item_sales)) if (batch_idx * batch_size + i) % 50 == 0]
+
+        """ 주 단위 3to6step 구하기"""
+        masking_start = 0
+        subsequent_mask = self._generate_square_subsequent_mask(self.output_len, masking_start)
+        forecasted_sales, pred_scale_0 = self.forward(item_sales, temporal_features, ntrends, images, texts, subsequent_mask, meta_data)
+        forecasted_sales_0 = forecasted_sales[:, :4]
+        pred_scale_0 = pred_scale_0
+
+        subsequent_mask = self._generate_square_subsequent_mask(self.output_len, masking_start)
+        forecasted_sales, pred_scale_1 = self.forward(item_sales, temporal_features, ntrends, images, texts, subsequent_mask, meta_data)
+        forecasted_sales_1 = forecasted_sales[:, 4:8]
+        pred_scale_1 = pred_scale_1
+
+        masking_start = 6
+        subsequent_mask = self._generate_square_subsequent_mask(self.output_len, masking_start)
+        forecasted_sales, pred_scale_2 = self.forward(item_sales, temporal_features, ntrends, images, texts, subsequent_mask, meta_data)
+        forecasted_sales_2 = forecasted_sales[:, 8:12]
+        pred_scale_2 = pred_scale_2
+
+        forecasted_sales_total = torch.cat([forecasted_sales_0, forecasted_sales_1, forecasted_sales_2], axis=1)
+
+        unscaled_forecasted_sales_0 = torch.stack([forecasted_sales_total[i,:4] + pred_scale_0[i] for i in range(len(forecasted_sales_total))])
+        unscaled_forecasted_sales_1 = torch.stack([forecasted_sales_total[i, 4:8] + pred_scale_1[i] for i in range(len(forecasted_sales_total))])
+        unscaled_forecasted_sales_2 = torch.stack([forecasted_sales_total[i, 8:12] + pred_scale_2[i] for i in range(len(forecasted_sales_total))])
+
+        unscaled_forecasted_sales_predscale = torch.cat([unscaled_forecasted_sales_0, unscaled_forecasted_sales_1, unscaled_forecasted_sales_2], axis=1)
+        unscaled_forecasted_sales_gtscale = torch.stack([forecasted_sales_total[i] * scalers[i, 1] + scalers[i, 0] for i in range(len(forecasted_sales_total))])
+
+        gt = real_value_sales[:, :self.val_output_week]
+        pred_gs = unscaled_forecasted_sales_gtscale[:, :self.val_output_week]
+        pred_ps = unscaled_forecasted_sales_predscale[:, :self.val_output_week]
+
+        r2_score, smape_adjust = self.get_score(gt, pred_ps)
+
+        self.log(f'{phase}_week_3to6step_r2score', r2_score)
+        self.log(f'{phase}_week_3to6step_ad_smape', smape_adjust)
+
+        pred_scales_mean = torch.mean(torch.stack([pred_scale_0, pred_scale_1, pred_scale_2]), axis=0)
+        smape_adjust_scale = torch.mean(torch.stack([ad_smape(pred_scales_mean.detach().cpu()[i], scalers[:, 0].detach().cpu()[i]) * 0.5 for i in range(len(scalers))]))
+
+        self.log(f'{phase}_week_3to6step_ad_smape_scale', smape_adjust_scale)
+
+        
+        for idx in plot_idx:
+            inner_idx = idx - batch_idx * batch_size
+            release_dates_p = release_dates.detach().cpu()[inner_idx]
+            release_dates_p = datetime.date(release_dates_p[0], release_dates_p[1], release_dates_p[2])
+            date_range = pd.date_range(release_dates_p, release_dates_p + relativedelta(weeks=self.val_output_week - 1), freq='7d')
+            item_number = train_df.iloc[idx]._name
+
+            self.plot_gt_pred(f'{phase}_week_3to6step', date_range, gt[inner_idx], pred_gs[inner_idx], pred_ps[inner_idx], item_number)
+            self.plot_image_text(item_number)
+
+        """3개월 metric 및 PLOT 그리기"""
+        
+        gt = week12_to_month3(real_value_sales[:, :self.val_output_week])
+        pred_gs = week12_to_month3(unscaled_forecasted_sales_gtscale[:, :self.val_output_week])
+        pred_ps = week12_to_month3(unscaled_forecasted_sales_predscale[:, :self.val_output_week])
+
+        r2_score, smape_adjust = self.get_score(gt, pred_ps)
+
+        self.log(f'{phase}_month_3to6step_r2score', r2_score)
+        self.log(f'{phase}_month_3to6step_ad_smape', smape_adjust)
+
+        for idx in plot_idx:
+            inner_idx = idx - batch_idx * batch_size
+            release_dates_p = release_dates.detach().cpu()[inner_idx]
+            release_dates_p = datetime.date(release_dates_p[0], release_dates_p[1], release_dates_p[2])
+            date_range = pd.date_range(release_dates_p,
+                                        release_dates_p + relativedelta(
+                                            months=self.val_output_month),
+                                        freq='m')[:self.val_output_month]
+            item_number = train_df.iloc[idx]._name
+
+            self.plot_gt_pred(f'{phase}_month_3to6step', date_range, gt[inner_idx], pred_gs[inner_idx], pred_ps[inner_idx], item_number)
+
+
+        """accumulation 표현"""
+
+        gt = torch.cumsum(gt, dim=-1)
+        pred_gs = torch.cumsum(pred_gs, dim=-1)
+        pred_ps = torch.cumsum(pred_ps, dim=-1)
+
+        gt_end = gt[:, -1]
+        pred_end_gs = pred_gs[:, -1]
+        pred_end_ps = pred_ps[:, -1]
+
+        ad_smape = SymmetricMeanAbsolutePercentageError()
+        smape_adjust = torch.mean(torch.stack([ad_smape(pred_end_ps.detach().cpu()[i], gt_end.detach().cpu()[i]) * 0.5
+                for i in range(len(gt_end))]))
+
+        self.log(f'{phase}_month_accum_3to6step_ad_smape', smape_adjust)
+
+        for idx in plot_idx:
+            inner_idx = idx - batch_idx * batch_size
+            release_dates_p = release_dates.detach().cpu()[inner_idx]
+            release_dates_p = datetime.date(release_dates_p[0], release_dates_p[1], release_dates_p[2])
+            date_range = pd.date_range(release_dates_p,
+                                        release_dates_p + relativedelta(
+                                            months=self.val_output_month),
+                                        freq='m')[:self.val_output_month]
+            item_number = train_df.iloc[idx]._name
+
+            self.plot_gt_pred(f'{phase}_month_accum_3to6step', date_range, gt[inner_idx], pred_gs[inner_idx], pred_ps[inner_idx], item_number)
 
 
     def get_given_n_score(self, batch, batch_idx, given_n, phase):
@@ -251,11 +391,11 @@ class GTM(pl.LightningModule):
         smape_adjust_reg = self.get_score(scalers[:, 0], pred_reg, inv_transform=True)
         self.log(f'{phase}_week_given{given_n}_ad_smape_regression', smape_adjust_reg)
 
-        # accuracy, recall, precision, f1_score = self.get_binary_score(qcut_label, pred_cls)
-        # self.log(f'{phase}_week_given{given_n}_accuracy', accuracy)
-        # self.log(f'{phase}_week_given{given_n}_recall', recall)
-        # self.log(f'{phase}_week_given{given_n}_precision', precision)
-        # self.log(f'{phase}_week_given{given_n}_f1_score', f1_score)
+        accuracy, recall, precision, f1_score = self.get_binary_score(qcut_label, pred_cls)
+        self.log(f'{phase}_week_given{given_n}_accuracy', accuracy)
+        self.log(f'{phase}_week_given{given_n}_recall', recall)
+        self.log(f'{phase}_week_given{given_n}_precision', precision)
+        self.log(f'{phase}_week_given{given_n}_f1_score', f1_score)
 
 
     def get_loss(self, batch, batch_idx, phase):
