@@ -15,14 +15,14 @@ from utils.get_features import Get_features
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ['CURL_CA_BUNDLE'] = ''
-wandb.login(key='bb98fa97c43ec61dc45feb0a9c45b3ce6d1353e1', relogin=True, force=True)
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 torch.autograd.set_detect_anomaly(True)
 torch.set_num_threads(1)
 
-def run(args):
+def run(args, i):
+    wandb.login(key='bb98fa97c43ec61dc45feb0a9c45b3ce6d1353e1', relogin=True, force=True)
     print(args)
     pl.seed_everything(args.seed)
 
@@ -40,44 +40,32 @@ def run(args):
     col_trend_per_item = pickle.load(
         open(os.path.join(args.prepo_data_folder, "col_trend_per_item_v4.pkl"), 'rb'))
 
-    df = df.loc[list(set(df.index).intersection(cat_trend_per_item.keys()))]
     df = df.drop(index=['MTPT6102', 'MUPT6102'])
 
-    meta_df = pd.read_csv("/home/smart01/SFLAB/su_GTM_t/GTM_T_sanguk/meta_data_image_text_nofilter.csv", index_col='item_number')
+    meta_df = pd.read_csv("/home/smart01/SFLAB/bonbak/data/preprocess/meta_data_ANTM.csv", index_col='item_number')
     
     test_list = pickle.load(open("/home/smart01/SFLAB/su_GTM_t/GTM_T_sanguk/12salesweek_test_item_number296.pkl", 'rb')).drop("MTPT6102")[:]
-    train_list = df.index[~df.index.isin(test_list)]
+    train_list = df.index[~df.index.isin(test_list)].drop('JROP328D').drop('JROP328E')[:]
     train_df = df.loc[train_list]
     test_df = df.loc[test_list]
 
-    qcut_df = pd.read_csv("/home/smart01/SFLAB/su_GTM_t/GTM_T_sanguk/qcut_df_bin10.csv", index_col='품번')
-    train_qdf = qcut_df.loc[train_list]
-    zero_idx = qcut_df['sales_mean']-train_qdf['sales_mean'].mean() <= train_qdf['sales_mean'].std()
-    qcut_df.loc[zero_idx.values, 'qcut_label'] = 0
-    qcut_df.loc[~zero_idx.values, 'qcut_label'] = 1
-    # qcut_df.loc[qcut_df['qcut_label'] != 0, 'qcut_label'] = 1
+    idx_list = pickle.load(open(f"/home/smart01/SFLAB/bonbak/data/index/index_list{i}", 'rb'))
 
-    # drop_list = qcut_df[qcut_df['qcut_label'] == 9].index
-    # qcut_df = qcut_df[~qcut_df.index.isin(drop_list)]
-    # train_df = train_df[~train_df.index.isin(drop_list)]
-    # test_df = test_df[~test_df.index.isin(drop_list)]
+    train_df = train_df[train_df.index.isin(idx_list)]
+    test_df = test_df[test_df.index.isin(idx_list)]
 
     train_dataset = ZeroShotDataset(args.sales_total_len, args.seq_len,
                                    args.output_dim, train_df,
                                    os.path.join(args.data_folder, "images"),
                                    cat_trend_per_item, fab_trend_per_item, col_trend_per_item,
-                                   text_des, args.text_embedder,
-                                    args.trend_len, args.scaler, args.no_scaling,
-                                    meta_df, qcut_df, train=True)
-    train_loader = train_dataset.get_loader(batch_size=args.batch_size, train=True)
+                                    args.trend_len, args.scaler, meta_df)
+    train_loader = train_dataset.get_loader(batch_size=args.batch_size)
 
     test_dataset = ZeroShotDataset(args.sales_total_len, args.seq_len,
                                    args.output_dim, test_df,
                                    os.path.join(args.data_folder, "images"),
                                    cat_trend_per_item, fab_trend_per_item, col_trend_per_item,
-                                   text_des, args.text_embedder,
-                                   args.trend_len, args.scaler, args.no_scaling,
-                                   meta_df, qcut_df, train_dataset.opt_lambda, train=False)
+                                   args.trend_len, args.scaler, meta_df, train_dataset.opt_lambda, train=False)
     test_loader = test_dataset.get_loader(batch_size=len(test_df), train=False)
 
     # Create model
@@ -99,20 +87,11 @@ def run(args):
         autoregressive=args.autoregressive,
         gpu_num=args.gpu_num,
         lr=args.learning_rate,
-        lead_time=args.lead_time,
         batch_size=args.batch_size,
-        no_scaling = args.no_scaling,
         ahead_step = args.ahead_step,
-        val_output_week = args.val_output_week,
-        val_output_month = args.val_output_month,
-        only_4weeks_loss = args.only_4weeks_loss,
-        get_features = get_features_class,
-        autoregressive_train = args.autoregressive_train,
         teacher_forcing = args.teacher_forcing,
         before_meta = args.before_meta,
-        qcut_label_mean = train_dataset.qcut_label_mean,
-        qcut_label_median = train_dataset.qcut_label_median,
-        boxcox_opt_lambda = train_dataset.opt_lambda,
+        total_scaler = train_dataset.total_scaler,
     )
 
 
@@ -124,7 +103,7 @@ def run(args):
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
         dirpath=args.log_dir + '/' + model_savename,
         filename='---{epoch}---',
-        monitor='valid_week_given0_ad_smape_mean',
+        monitor='valid_week_given0_ad_smape',
         mode='min',
         save_top_k=1,
         save_last=True,
@@ -136,7 +115,8 @@ def run(args):
                          logger=wandb_logger, callbacks=[checkpoint_callback])
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
-    trainer.test(model, dataloaders=test_loader, )
+    trainer.test(model, dataloaders=test_loader,)
+    wandb.finish()
 
 
 
@@ -222,8 +202,7 @@ if __name__ == '__main__':
     # args.gpu_num = 0
     args.before_meta = False # True #
 
-    run(args)
-    # 1일때는 32batch
-    # 2일때는 16batch
-    # 4일때는 8batch
-    # 8일때는 4batch
+    for i in range(12):
+        run(args, i)
+
+

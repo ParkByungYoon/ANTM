@@ -18,7 +18,7 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 class ZeroShotDataset():
     def __init__(self, sales_total_len, seq_len, output_dim, data_df, img_root,
                  cat_trend, fab_trend, col_trend, trend_len,
-                 scaler, no_scaling, meta_df, qcut_df, opt_lambda=None, train=True):
+                 item_scaler, meta_df, opt_lambda=None, train=True):
         self.sales_total_len = sales_total_len
         self.seq_len = seq_len
         self.output_dim = output_dim
@@ -30,23 +30,14 @@ class ZeroShotDataset():
         self.fab_trend = fab_trend
         self.col_trend = col_trend
 
-        self.img_df = meta_df.loc[:,meta_df.columns.str.startswith('img')]
         self.text_df = meta_df.loc[:,meta_df.columns.str.startswith('text')]
-        self.meta_df = meta_df.iloc[:,3:26]
+        self.meta_df = meta_df.iloc[:,meta_df.columns.str.startswith('fabric')]
 
+        self.total_scaler = StandardScaler().fit(meta_df.loc[self.data_df.index, 'sales_mean'].values.reshape(-1, 1))
         self.trend_len = trend_len
-        self.scaler = StandardScaler() if scaler == "standard" else MinMaxScaler()
-        self.no_scaling = no_scaling
-
+        self.item_scaler = StandardScaler() if item_scaler == "standard" else MinMaxScaler()
         
-        self.qcut_df = qcut_df
-        self.qcut_label_mean = qcut_df.groupby('qcut_label')['sales_mean'].mean().values
-        self.qcut_label_median = qcut_df.groupby('qcut_label')['sales_mean'].median().values
-
-        if opt_lambda == None:
-            _, self.opt_lambda = boxcox(qcut_df.loc[self.data_df.index, 'sales_mean'])
-        else:
-            self.opt_lambda = opt_lambda
+        _, self.opt_lambda = boxcox(meta_df.loc[self.data_df.index, 'sales_mean']) if train else (None, opt_lambda)
 
         self.train = train
         self.past_trend_len = trend_len - sales_total_len
@@ -66,9 +57,8 @@ class ZeroShotDataset():
 
         # Get the Gtrends time series associated with each product
         # Read the images (extracted image features) as well
-        sales, release_dates, ntrends, image_features, text_features, sales_stamps, scalers, real_value_sales, item_numbers_idx = [], [], [], [], [], [], [], [], []
+        sales, release_dates, ntrends, image_features, text_features, sales_stamps, item_scalers, real_value_sales, item_numbers_idx = [], [], [], [], [], [], [], [], []
         metas = []
-        qcut_labels = []
         target_regs = []
 
         img_transforms = Compose([Resize((256, 256)), ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
@@ -80,12 +70,6 @@ class ZeroShotDataset():
 
             meta = self.meta_df.loc[idx].values
             metas.append(meta)
-
-            qcut = int(self.qcut_df.loc[idx]['qcut_label'])
-            qcut_labels.append(qcut)
-
-            reg = boxcox(self.qcut_df.loc[idx]['sales_mean'], self.opt_lambda)
-            target_regs.append(reg)
 
             sales_stamp = []
 
@@ -104,18 +88,16 @@ class ZeroShotDataset():
             real_value_sale = torch.FloatTensor(np.array(row))
             real_value_sales.append(real_value_sale)
 
-            # sale = np.array(row) / 290
-            sale = self.scaler.fit_transform(np.array(row).reshape(-1, 1)).flatten()
+            sale = self.item_scaler.fit_transform(np.array(row).reshape(-1, 1)).flatten()
+            sales.append(torch.FloatTensor(sale))
 
-            if self.no_scaling:
-                sale = np.array(row)
+            reg = self.total_scaler.transform(self.item_scaler.mean_.reshape(-1,1))
+            target_regs.append(torch.FloatTensor(reg))
 
-            sale = torch.FloatTensor(sale)
-
-            sales.append(sale)
-
-
-            scalers.append([self.scaler.mean_, self.scaler.scale_]) if isinstance(self.scaler, StandardScaler) else scalers.append([self.scaler.data_min_, self.scaler.data_range_])
+            if isinstance(self.item_scaler, StandardScaler):
+                item_scalers.append([self.item_scaler.mean_, self.item_scaler.scale_])
+            else:
+                item_scalers.append([self.item_scaler.data_min_, self.item_scaler.data_range_])
 
             if idx in self.cat_trend.keys():
                 cat_ntrend = np.array(self.cat_trend[idx]).reshape(-1,1)
@@ -166,7 +148,7 @@ class ZeroShotDataset():
         ntrends = torch.stack(ntrends, dim=0)
         images = torch.stack(image_features, dim=0)
         texts = torch.stack(text_features, dim=0)
-        scalers = torch.FloatTensor(np.array(scalers)).view(-1, 2)
+        item_scalers = torch.FloatTensor(np.array(item_scalers)).view(-1, 2)
 
         real_value_sales = torch.stack(real_value_sales, dim=0)
 
@@ -174,15 +156,12 @@ class ZeroShotDataset():
 
         item_numbers_idx = torch.tensor(item_numbers_idx)
 
-        meta_data = torch.FloatTensor(metas)
-        qcut_labels = torch.LongTensor(qcut_labels)
-
+        meta_data = torch.FloatTensor(np.array(metas))
         target_reg = torch.FloatTensor(target_regs)
 
         
-        return TensorDataset(item_sales, temporal_features, ntrends, images, texts, scalers,
-                             real_value_sales, release_dates, item_numbers_idx, meta_data, 
-                             qcut_labels, target_reg)
+        return TensorDataset(item_sales, temporal_features, ntrends, images, texts, item_scalers,
+                             real_value_sales, release_dates, item_numbers_idx, meta_data, target_reg)
 
     def get_loader(self, batch_size, train=True):
         print('Starting dataset creation process...')
