@@ -112,7 +112,8 @@ def run(args, i):
 
     trainer = pl.Trainer(accelerator="gpu", devices=[args.gpu_num], 
                          max_epochs=args.epochs, check_val_every_n_epoch=2,
-                         logger=wandb_logger, callbacks=[checkpoint_callback])
+                         logger=wandb_logger, callbacks=[checkpoint_callback], 
+                         log_every_n_steps=len(train_loader))
     
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
     trainer.test(model, dataloaders=test_loader,)
